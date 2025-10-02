@@ -1,0 +1,255 @@
+# streamlit_app.py
+import math
+from datetime import datetime, timezone
+from typing import Optional, Tuple, Dict, List
+
+import pandas as pd
+import requests
+import streamlit as st
+
+st.set_page_config(page_title="BTC/ETH Longs vs Shorts (Aggregated)", page_icon="📊", layout="wide")
+
+BINANCE_BASE = "https://fapi.binance.com"
+BYBIT_BASE = "https://api.bybit.com"
+
+# ---------------- HTTP helper ----------------
+
+def _get(url: str, params: dict | None = None, timeout: float = 10.0):
+    try:
+        r = requests.get(url, params=params, timeout=timeout, headers={
+            "User-Agent": "agg-longs-shorts-streamlit/1.0"
+        })
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return None
+
+# ---------------- Binance ----------------
+
+def binance_long_short_account_ratio(symbol: str, period: str = "5m") -> Optional[Tuple[float, float]]:
+    url = f"{BINANCE_BASE}/futures/data/globalLongShortAccountRatio"
+    data = _get(url, params={"symbol": symbol, "period": period, "limit": 1})
+    if not isinstance(data, list) or not data:
+        return None
+    d0 = data[-1]
+    # Prefer explicit shares if present; otherwise use ratio
+    long_share = d0.get("longAccount")
+    short_share = d0.get("shortAccount")
+    if long_share is not None and short_share is not None:
+        try:
+            long_share = float(long_share)
+            short_share = float(short_share)
+            s = long_share + short_share
+            if s > 0:
+                return long_share/s, short_share/s
+        except Exception:
+            pass
+    # Fallback: longShortRatio -> shares
+    try:
+        ratio = float(d0.get("longShortRatio"))
+        if ratio > 0:
+            long_share = ratio / (1.0 + ratio)
+            short_share = 1.0 - long_share
+            return long_share, short_share
+    except Exception:
+        return None
+    return None
+
+def binance_open_interest_value_usd(symbol: str, period: str = "5m") -> Optional[float]:
+    url = f"{BINANCE_BASE}/futures/data/openInterestHist"
+    data = _get(url, params={"symbol": symbol, "period": period, "limit": 1})
+    if not isinstance(data, list) or not data:
+        return None
+    d0 = data[-1]
+    try:
+        return float(d0.get("sumOpenInterestValue"))
+    except Exception:
+        return None
+
+# ---------------- Bybit ----------------
+
+def bybit_long_short_account_ratio(symbol: str, period: str = "5min") -> Optional[Tuple[float, float]]:
+    url = f"{BYBIT_BASE}/v5/market/account-ratio"
+    data = _get(url, params={"category": "linear", "symbol": symbol, "period": period, "limit": 1})
+    if not isinstance(data, dict):
+        return None
+    result = data.get("result") or {}
+    lst = result.get("list") or []
+    if not lst:
+        return None
+    d0 = lst[0]
+    try:
+        long_share = float(d0.get("buyRatio"))
+        short_share = float(d0.get("sellRatio"))
+        s = long_share + short_share
+        if s > 0:
+            return long_share/s, short_share/s
+    except Exception:
+        return None
+    return None
+
+def bybit_last_price(symbol: str) -> Optional[float]:
+    url = f"{BYBIT_BASE}/v5/market/tickers"
+    data = _get(url, params={"category": "linear", "symbol": symbol})
+    if not isinstance(data, dict):
+        return None
+    result = data.get("result") or {}
+    lst = result.get("list") or []
+    if not lst:
+        return None
+    d0 = lst[0]
+    try:
+        return float(d0.get("lastPrice"))
+    except Exception:
+        return None
+
+def bybit_open_interest_value_usd(symbol: str, period: str = "5min") -> Optional[float]:
+    price = bybit_last_price(symbol)
+    if price is None or price <= 0:
+        return None
+    url = f"{BYBIT_BASE}/v5/market/open-interest"
+    data = _get(url, params={"category": "linear", "symbol": symbol, "intervalTime": period, "limit": 1})
+    if not isinstance(data, dict):
+        return None
+    result = data.get("result") or {}
+    lst = result.get("list") or []
+    if not lst:
+        return None
+    d0 = lst[0]
+    try:
+        oi_coin = float(d0.get("openInterest"))
+        return oi_coin * price
+    except Exception:
+        return None
+
+# ---------------- Aggregation ----------------
+
+def aggregate_for_symbol(symbol: str, period_binance: str = "5m", period_bybit: str = "5min") -> dict:
+    rows = []
+    b_ratio = binance_long_short_account_ratio(symbol, period=period_binance)
+    b_oi = binance_open_interest_value_usd(symbol, period=period_binance)
+    if b_ratio and b_oi and b_oi > 0:
+        rows.append({"exchange": "Binance", "long_share": b_ratio[0], "short_share": b_ratio[1], "oi_usd": b_oi})
+    y_ratio = bybit_long_short_account_ratio(symbol, period=period_bybit)
+    y_oi = bybit_open_interest_value_usd(symbol, period=period_bybit)
+    if y_ratio and y_oi and y_oi > 0:
+        rows.append({"exchange": "Bybit", "long_share": y_ratio[0], "short_share": y_ratio[1], "oi_usd": y_oi})
+
+    total_oi = sum(r["oi_usd"] for r in rows) if rows else 0.0
+    if total_oi <= 0:
+        return {
+            "symbol": symbol,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "exchanges_used": [],
+            "agg_long_share": None,
+            "agg_short_share": None,
+            "agg_long_short_ratio": None,
+            "per_exchange": rows
+        }
+
+    agg_long = sum(r["long_share"] * r["oi_usd"] for r in rows) / total_oi
+    agg_short = 1.0 - agg_long
+    agg_ratio = agg_long / agg_short if agg_short > 0 else math.inf
+
+    return {
+        "symbol": symbol,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "exchanges_used": [r["exchange"] for r in rows],
+        "agg_long_share": agg_long,
+        "agg_short_share": agg_short,
+        "agg_long_short_ratio": agg_ratio,
+        "per_exchange": rows,
+        "total_oi": total_oi
+    }
+
+# --------------- UI helpers ---------------
+
+def fmt_pct(x: Optional[float]) -> str:
+    if x is None or not isinstance(x, (int, float)) or math.isnan(x):
+        return "n/a"
+    return f"{x*100:.2f}%"
+
+def fmt_money(x: Optional[float]) -> str:
+    if x is None or not isinstance(x, (int, float)) or math.isnan(x):
+        return "n/a"
+    if x >= 1e12: return f"${x/1e12:.2f}T"
+    if x >= 1e9:  return f"${x/1e9:.2f}B"
+    if x >= 1e6:  return f"${x/1e6:.2f}M"
+    if x >= 1e3:  return f"${x/1e3:.2f}K"
+    return f"${x:.2f}"
+
+@st.cache_data(ttl=30)
+def get_aggregates(symbols: List[str], binance_period: str, bybit_period: str) -> List[dict]:
+    return [aggregate_for_symbol(sym, period_binance=binance_period, period_bybit=bybit_period) for sym in symbols]
+
+# --------------- Sidebar controls ---------------
+
+st.sidebar.title("Settings")
+symbols = st.sidebar.multiselect("Symbols", ["BTCUSDT", "ETHUSDT"], default=["BTCUSDT", "ETHUSDT"])
+col1, col2 = st.sidebar.columns(2)
+with col1:
+    binance_period = st.selectbox("Binance period", ["5m", "15m", "30m", "1h", "4h", "1d"], index=0)
+with col2:
+    bybit_period = st.selectbox("Bybit period", ["5min", "15min", "30min", "1h", "4h", "1d"], index=0)
+
+refresh_sec = st.sidebar.slider("Auto-refresh (seconds)", min_value=15, max_value=300, value=30, step=15)
+refresh_key = st.sidebar.text_input("Refresh key (advanced)", value="auto1")
+
+st.title("📊 BTC/ETH Longs vs Shorts — Aggregated by USD Open Interest")
+st.caption("Sources: Binance USDⓈ-M & Bybit (linear USDT). Figures are *account-based* long/short shares weighted by USD open interest.")
+
+# Trigger auto-refresh
+st_autorefresh = st.experimental_rerun  # fallback if st_autorefresh not present
+try:
+    from streamlit_autorefresh import st_autorefresh as _st_autorefresh
+    result = _st_autorefresh(interval=refresh_sec * 1000, key=refresh_key)
+except Exception:
+    pass
+
+# --------------- Fetch & display ---------------
+
+if not symbols:
+    st.info("Choose at least one symbol in the sidebar.")
+else:
+    results = get_aggregates(symbols, binance_period, bybit_period)
+
+    for res in results:
+        st.subheader(f"{res['symbol']}")
+
+        if res["agg_long_share"] is None:
+            st.warning("No data available right now (rate limits or endpoint issue). Try a different period or refresh.")
+            continue
+
+        # Top KPI row
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Agg Long %", fmt_pct(res["agg_long_share"]))
+        k2.metric("Agg Short %", fmt_pct(res["agg_short_share"]))
+        k3.metric("L/S Ratio", f"{res['agg_long_short_ratio']:.3f}")
+        k4.metric("Total OI (USD, est.)", fmt_money(res.get("total_oi")))
+
+        # Build per-exchange DataFrame
+        df = pd.DataFrame(res["per_exchange"])
+        if not df.empty:
+            df["long_%"] = df["long_share"] * 100.0
+            df["short_%"] = df["short_share"] * 100.0
+            total_oi = df["oi_usd"].sum()
+            df["oi_weight_%"] = (df["oi_usd"] / total_oi) * 100.0 if total_oi > 0 else 0.0
+            df_fmt = df[["exchange", "long_%", "short_%", "oi_weight_%", "oi_usd"]].copy()
+            df_fmt = df_fmt.rename(columns={
+                "exchange": "Exchange",
+                "long_%": "Long %",
+                "short_%": "Short %",
+                "oi_weight_%": "Weight by OI %",
+                "oi_usd": "Open Interest (USD est.)"
+            })
+            st.dataframe(df_fmt.style.format({"Long %": "{:.2f}%", "Short %": "{:.2f}%", "Weight by OI %": "{:.2f}%", "Open Interest (USD est.)": "${:,.0f}"}), use_container_width=True)
+
+        st.caption(f"Last updated (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} · Periods — Binance: {binance_period}, Bybit: {bybit_period}")
+
+st.divider()
+st.markdown("""
+**Notes**
+- *Account Ratio* measures the share of **accounts** that are net-long vs net-short, not notional size.
+- Weighting by USD open interest helps balance exchanges with different user bases.
+- Endpoints are public; no API keys needed. If you see temporary gaps, it's usually rate limits.
+""")
